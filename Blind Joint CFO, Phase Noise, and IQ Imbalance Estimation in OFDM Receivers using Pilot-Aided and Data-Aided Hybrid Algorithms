@@ -1,0 +1,140 @@
+clc; clear; close all;
+
+%% PARAMETERS
+N = 64;                  % Number of subcarriers
+cpLen = 16;              % Cyclic prefix length
+numSymbols = 50;         % OFDM symbols
+SNR = 20;                % SNR in dB
+
+CFO = 0.05;              % Normalized CFO
+phaseNoiseVar = 1e-3;    % Phase noise variance
+iq_gain_imb = 0.1;       % IQ gain imbalance
+iq_phase_imb = 5*pi/180; % IQ phase imbalance
+
+%% TRANSMITTER
+
+% QPSK Modulation
+data = randi([0 3], N, numSymbols);
+modData = pskmod(data, 4, pi/4);
+
+% Insert pilots (every 4th subcarrier)
+pilotIdx = 1:4:N;
+modData(pilotIdx, :) = 1 + 1j;
+
+% IFFT
+tx_ifft = ifft(modData, N);
+
+% Add CP
+tx_cp = [tx_ifft(end-cpLen+1:end, :); tx_ifft];
+
+txSignal = tx_cp(:);
+
+%% CHANNEL IMPAIRMENTS
+
+n = (0:length(txSignal)-1)';
+
+% CFO effect
+cfoSignal = txSignal .* exp(1j*2*pi*CFO*n/N);
+
+% Phase Noise (Wiener process)
+phaseNoise = cumsum(sqrt(phaseNoiseVar)*randn(size(n)));
+pnSignal = cfoSignal .* exp(1j*phaseNoise);
+
+% IQ Imbalance
+I = real(pnSignal);
+Q = imag(pnSignal);
+
+I_new = (1 + iq_gain_imb) * I;
+Q_new = (1 - iq_gain_imb) * Q;
+
+iqSignal = I_new + 1j*Q_new.*exp(1j*iq_phase_imb);
+
+% Add AWGN
+rxSignal = awgn(iqSignal, SNR, 'measured');
+
+%% RECEIVER
+
+% Reshape
+rxMatrix = reshape(rxSignal, N+cpLen, numSymbols);
+
+% Remove CP
+rx_noCP = rxMatrix(cpLen+1:end, :);
+
+% FFT
+rx_fft = fft(rx_noCP, N);
+
+%% ------------------ ESTIMATION ------------------
+
+%% 1. CFO ESTIMATION (Blind using CP correlation)
+cfo_est = 0;
+for i = 1:numSymbols
+    sym = rxMatrix(:, i);
+    cp = sym(1:cpLen);
+    data_part = sym(N+1:N+cpLen);
+    
+    cfo_est = cfo_est + angle(sum(conj(cp).*data_part));
+end
+cfo_est = cfo_est / (2*pi*cpLen*numSymbols);
+
+fprintf('Estimated CFO: %.4f\n', cfo_est);
+
+% CFO Compensation
+n2 = (0:length(rxSignal)-1)';
+rx_cfo_corrected = rxSignal .* exp(-1j*2*pi*cfo_est*n2/N);
+
+%% Reprocess after CFO correction
+rxMatrix = reshape(rx_cfo_corrected, N+cpLen, numSymbols);
+rx_noCP = rxMatrix(cpLen+1:end, :);
+rx_fft = fft(rx_noCP, N);
+
+%% 2. PHASE NOISE ESTIMATION (Pilot-Aided)
+phase_est = zeros(1, numSymbols);
+
+for i = 1:numSymbols
+    rxPilots = rx_fft(pilotIdx, i);
+    phase_est(i) = angle(mean(rxPilots));
+end
+
+% Phase correction
+for i = 1:numSymbols
+    rx_fft(:, i) = rx_fft(:, i) * exp(-1j*phase_est(i));
+end
+
+fprintf('Phase Noise Estimated & Corrected\n');
+
+%% 3. IQ IMBALANCE ESTIMATION (Data-Aided)
+
+% Simple estimation using image rejection
+rx_conj = conj(flipud(rx_fft));
+iq_est = mean(abs(rx_fft - rx_conj), 'all');
+
+fprintf('Estimated IQ Imbalance metric: %.4f\n', iq_est);
+
+%% DEMODULATION
+
+demodData = pskdemod(rx_fft, 4, pi/4);
+
+%% BER CALCULATION
+
+% Ignore pilots
+dataIdx = setdiff(1:N, pilotIdx);
+
+txBits = data(dataIdx, :);
+rxBits = demodData(dataIdx, :);
+
+[numErr, ber] = biterr(txBits, rxBits);
+
+fprintf('BER: %e\n', ber);
+
+%% PLOTS
+
+figure;
+subplot(2,1,1);
+plot(real(rx_fft(:)), imag(rx_fft(:)), 'o');
+title('Constellation after Compensation');
+grid on;
+
+subplot(2,1,2);
+plot(phase_est);
+title('Estimated Phase Noise per Symbol');
+grid on;
